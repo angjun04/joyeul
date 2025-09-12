@@ -1,10 +1,11 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import useSWR from 'swr';
 
 const DEFAULT_START_HOUR = 9;
 const DEFAULT_END_HOUR = 22;
+const AUTOSAVE_DELAY_MS = 5000; // 5초 후 자동 저장
 
 interface Participant {
   id: string;
@@ -43,28 +44,73 @@ export default function Home() {
   const [loginError, setLoginError] = useState('');
   const [isCreating, setIsCreating] = useState(false);
   const [successMessage, setSuccessMessage] = useState('');
+  
+  // 로컬 일정 상태 (편집 중인 데이터)
+  const [localSchedule, setLocalSchedule] = useState<Record<string, boolean>>({});
+  const [isSaving, setIsSaving] = useState(false);
+  const [hasChanges, setHasChanges] = useState(false);
+  const [lastSavedSchedule, setLastSavedSchedule] = useState<Record<string, boolean>>({});
+  const [autoSaveEnabled, setAutoSaveEnabled] = useState(false);
+  const [autoSaveTimer, setAutoSaveTimer] = useState<NodeJS.Timeout | null>(null);
 
   // Use SWR for real-time room updates
   const { data: roomData, mutate } = useSWR(
     currentRoom ? `/api/rooms/${currentRoom.code}` : null,
     fetcher,
     { 
-      refreshInterval: 3000, // Poll every 3 seconds
+      refreshInterval: viewMode === 'view' ? 3000 : 10000, // 보기 모드에서만 자주 갱신
       onError: (err) => {
         console.error('SWR Error:', err);
       }
     }
   );
 
+  // 서버 데이터가 업데이트되면 반영
   useEffect(() => {
     if (roomData && currentRoom) {
       console.log('Room data updated:', roomData);
       // Ensure the data has proper structure before updating
       if (roomData.code && roomData.participants !== undefined) {
         setCurrentRoom(roomData);
+        
+        // 편집 모드가 아니거나 변경사항이 없을 때만 로컬 스케줄 업데이트
+        if (viewMode === 'view' || !hasChanges) {
+          const currentParticipant = roomData.participants[currentUserId];
+          if (currentParticipant) {
+            setLocalSchedule(currentParticipant.schedule || {});
+            setLastSavedSchedule(currentParticipant.schedule || {});
+          }
+        }
       }
     }
-  }, [roomData]); // currentRoom?.code로 충분
+  }, [roomData, currentUserId, viewMode, hasChanges]);
+
+  // 자동 저장 로직
+  useEffect(() => {
+    if (autoSaveEnabled && hasChanges && viewMode === 'edit') {
+      // 이전 타이머 취소
+      if (autoSaveTimer) {
+        clearTimeout(autoSaveTimer);
+      }
+      
+      // 새 타이머 설정
+      const timer = setTimeout(() => {
+        saveSchedule();
+      }, AUTOSAVE_DELAY_MS);
+      
+      setAutoSaveTimer(timer);
+      
+      return () => {
+        if (timer) clearTimeout(timer);
+      };
+    }
+  }, [localSchedule, autoSaveEnabled, hasChanges]);
+
+  // 변경사항 체크
+  useEffect(() => {
+    const hasLocalChanges = JSON.stringify(localSchedule) !== JSON.stringify(lastSavedSchedule);
+    setHasChanges(hasLocalChanges);
+  }, [localSchedule, lastSavedSchedule]);
 
   const createNewRoom = async () => {
     if (!userName.trim()) {
@@ -87,7 +133,9 @@ export default function Home() {
       setCurrentRoom(data.room);
       setCurrentUserId(data.userId);
       setRoomCode(data.room.code);
-      setLoginError(''); // Clear any previous errors
+      setLocalSchedule({});
+      setLastSavedSchedule({});
+      setLoginError('');
       
       // 방 코드를 클립보드에 복사
       if (navigator.clipboard) {
@@ -142,43 +190,103 @@ export default function Home() {
       console.log('Joined room:', data);
       setCurrentRoom(data.room);
       setCurrentUserId(data.userId);
-      setLoginError(''); // Clear any previous errors
+      
+      // 기존 일정 로드
+      const participant = data.room.participants[data.userId];
+      if (participant) {
+        setLocalSchedule(participant.schedule || {});
+        setLastSavedSchedule(participant.schedule || {});
+      }
+      
+      setLoginError('');
     } catch (error) {
       console.error('Join room error:', error);
       setLoginError('방 참여에 실패했습니다.');
     }
   };
 
-  const toggleTimeSlot = async (slotKey: string) => {
-    if (!currentRoom || viewMode !== 'edit' || !currentRoom.participants) return;
+  // 로컬에서만 토글 (서버 요청 없음)
+  const toggleTimeSlot = (slotKey: string) => {
+    if (viewMode !== 'edit') return;
 
-    const participant = currentRoom.participants[currentUserId];
-    if (!participant) return;
+    setLocalSchedule(prev => {
+      const newSchedule = { ...prev };
+      if (newSchedule[slotKey]) {
+        delete newSchedule[slotKey];
+      } else {
+        newSchedule[slotKey] = true;
+      }
+      return newSchedule;
+    });
+  };
 
-    const newSchedule = { ...participant.schedule };
-    if (newSchedule[slotKey]) {
-      delete newSchedule[slotKey];
-    } else {
-      newSchedule[slotKey] = true;
-    }
+  // 일정 저장 (서버에 한 번에 전송)
+  const saveSchedule = async () => {
+    if (!currentRoom || !hasChanges) return;
 
+    setIsSaving(true);
     try {
-      await fetch(`/api/rooms/${currentRoom.code}/schedule`, {
+      const response = await fetch(`/api/rooms/${currentRoom.code}/schedule`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           userId: currentUserId,
-          schedule: newSchedule,
+          schedule: localSchedule,
         }),
       });
 
-      mutate(); // Trigger SWR revalidation
+      if (!response.ok) throw new Error('Failed to save schedule');
+
+      setLastSavedSchedule(localSchedule);
+      setHasChanges(false);
+      
+      // 성공 메시지
+      setSuccessMessage('일정이 저장되었습니다!');
+      setTimeout(() => setSuccessMessage(''), 2000);
+      
+      // SWR 갱신
+      await mutate();
     } catch (error) {
-      console.error('Failed to update schedule:', error);
+      console.error('Failed to save schedule:', error);
+      setLoginError('일정 저장에 실패했습니다.');
+    } finally {
+      setIsSaving(false);
     }
   };
 
+  // 변경사항 취소
+  const cancelChanges = () => {
+    setLocalSchedule(lastSavedSchedule);
+    setHasChanges(false);
+  };
+
+  // 전체 선택/해제
+  const selectAll = () => {
+    const days = getDaysInRange();
+    const newSchedule: Record<string, boolean> = {};
+    
+    days.forEach(day => {
+      for (let hour = DEFAULT_START_HOUR; hour < DEFAULT_END_HOUR; hour++) {
+        const slotKey = `${formatDate(day)}_${hour}`;
+        newSchedule[slotKey] = true;
+      }
+    });
+    
+    setLocalSchedule(newSchedule);
+  };
+
+  const clearAll = () => {
+    setLocalSchedule({});
+  };
+
   const leaveRoom = () => {
+    // 변경사항이 있으면 확인
+    if (hasChanges && viewMode === 'edit') {
+      if (!confirm('저장하지 않은 변경사항이 있습니다. 정말 나가시겠습니까?')) {
+        return;
+      }
+    }
+    
     setCurrentRoom(null);
     setCurrentUserId('');
     setRoomCode('');
@@ -186,6 +294,13 @@ export default function Home() {
     setViewMode('edit');
     setLoginError('');
     setSuccessMessage('');
+    setLocalSchedule({});
+    setLastSavedSchedule({});
+    setHasChanges(false);
+    
+    if (autoSaveTimer) {
+      clearTimeout(autoSaveTimer);
+    }
   };
 
   const formatDate = (date: Date): string => {
@@ -256,6 +371,11 @@ export default function Home() {
 
     return timeSlots.sort((a, b) => b.availability.count - a.availability.count).slice(0, 5);
   };
+
+  // 선택된 슬롯 개수 계산
+  const selectedSlotsCount = useMemo(() => {
+    return Object.keys(localSchedule).filter(key => localSchedule[key]).length;
+  }, [localSchedule]);
 
   if (!currentRoom) {
     return (
@@ -332,21 +452,6 @@ export default function Home() {
                 참여하기
               </button>
             </div>
-            
-            {process.env.NODE_ENV === 'development' && (
-              <div className="mt-6 pt-6 border-t border-gray-200 text-center text-xs text-gray-400">
-                <a 
-                  href="/api/rooms/debug" 
-                  target="_blank" 
-                  rel="noopener noreferrer"
-                  className="hover:text-gray-600 underline"
-                >
-                  디버그 페이지
-                </a>
-                <span className="mx-2">•</span>
-                <span>테스트 방: TEST1234</span>
-              </div>
-            )}
           </div>
         </div>
       </div>
@@ -395,29 +500,110 @@ export default function Home() {
       </div>
 
       <div className="max-w-7xl mx-auto p-6">
-        {/* View Mode Toggle */}
-        <div className="flex gap-1 p-1 bg-gray-100 rounded-lg mb-8 inline-flex">
-          <button
-            onClick={() => setViewMode('edit')}
-            className={`px-6 py-2.5 rounded-md font-medium text-sm transition-all ${
-              viewMode === 'edit'
-                ? 'bg-white text-gray-900 shadow-sm'
-                : 'text-gray-600 hover:text-gray-900'
-            }`}
-          >
-            내 일정 편집
-          </button>
-          <button
-            onClick={() => setViewMode('view')}
-            className={`px-6 py-2.5 rounded-md font-medium text-sm transition-all ${
-              viewMode === 'view'
-                ? 'bg-white text-gray-900 shadow-sm'
-                : 'text-gray-600 hover:text-gray-900'
-            }`}
-          >
-            전체 일정 보기
-          </button>
+        {/* View Mode Toggle & Save Controls */}
+        <div className="flex justify-between items-start mb-8">
+          <div className="flex gap-1 p-1 bg-gray-100 rounded-lg inline-flex">
+            <button
+              onClick={() => setViewMode('edit')}
+              className={`px-6 py-2.5 rounded-md font-medium text-sm transition-all ${
+                viewMode === 'edit'
+                  ? 'bg-white text-gray-900 shadow-sm'
+                  : 'text-gray-600 hover:text-gray-900'
+              }`}
+            >
+              내 일정 편집
+            </button>
+            <button
+              onClick={() => setViewMode('view')}
+              className={`px-6 py-2.5 rounded-md font-medium text-sm transition-all ${
+                viewMode === 'view'
+                  ? 'bg-white text-gray-900 shadow-sm'
+                  : 'text-gray-600 hover:text-gray-900'
+              }`}
+            >
+              전체 일정 보기
+            </button>
+          </div>
+
+          {/* 편집 모드일 때 저장 컨트롤 */}
+          {viewMode === 'edit' && (
+            <div className="flex items-center gap-3">
+              {/* 자동 저장 토글 */}
+              <label className="flex items-center gap-2 px-4 py-2 bg-gray-50 rounded-lg cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={autoSaveEnabled}
+                  onChange={(e) => setAutoSaveEnabled(e.target.checked)}
+                  className="w-4 h-4 text-blue-600 bg-gray-100 rounded focus:ring-blue-500"
+                />
+                <span className="text-sm text-gray-700">자동 저장</span>
+              </label>
+
+              {/* 선택된 시간 표시 */}
+              <div className="px-4 py-2 bg-gray-50 rounded-lg">
+                <span className="text-sm text-gray-600">선택된 시간:</span>
+                <span className="ml-2 font-medium text-gray-900">{selectedSlotsCount}개</span>
+              </div>
+
+              {/* 빠른 선택 버튼 */}
+              <button
+                onClick={selectAll}
+                className="px-4 py-2 text-sm bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition-colors"
+              >
+                전체 선택
+              </button>
+              <button
+                onClick={clearAll}
+                className="px-4 py-2 text-sm bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition-colors"
+              >
+                전체 해제
+              </button>
+
+              {/* 저장/취소 버튼 */}
+              {hasChanges && (
+                <>
+                  <button
+                    onClick={cancelChanges}
+                    className="px-5 py-2 text-sm text-gray-600 hover:text-gray-900 transition-colors"
+                  >
+                    취소
+                  </button>
+                  <button
+                    onClick={saveSchedule}
+                    disabled={isSaving}
+                    className={`px-6 py-2 text-sm font-medium text-white rounded-lg transition-all ${
+                      isSaving 
+                        ? 'bg-gray-400 cursor-not-allowed' 
+                        : 'bg-blue-600 hover:bg-blue-700 shadow-sm hover:shadow-md'
+                    } ${hasChanges ? 'ring-2 ring-blue-500 ring-offset-2' : ''}`}
+                  >
+                    {isSaving ? '저장 중...' : '저장하기'}
+                  </button>
+                </>
+              )}
+            </div>
+          )}
         </div>
+
+        {/* 알림 메시지 */}
+        {successMessage && (
+          <div className="mb-4 bg-green-50 border border-green-200 text-green-700 p-4 rounded-lg text-sm flex items-center">
+            <svg className="w-5 h-5 mr-2" fill="currentColor" viewBox="0 0 20 20">
+              <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+            </svg>
+            {successMessage}
+          </div>
+        )}
+
+        {/* 변경사항 알림 */}
+        {viewMode === 'edit' && hasChanges && !autoSaveEnabled && (
+          <div className="mb-4 bg-amber-50 border border-amber-200 text-amber-800 p-4 rounded-lg text-sm flex items-center">
+            <svg className="w-5 h-5 mr-2" fill="currentColor" viewBox="0 0 20 20">
+              <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+            </svg>
+            저장하지 않은 변경사항이 있습니다. 저장 버튼을 눌러 변경사항을 반영하세요.
+          </div>
+        )}
 
         {/* Participants */}
         <div className="bg-white rounded-xl border border-gray-200 p-6 mb-8">
@@ -451,10 +637,16 @@ export default function Home() {
               <span className="text-sm text-gray-600">선택 안됨</span>
             </div>
             {viewMode === 'edit' && (
-              <div className="flex items-center gap-2">
-                <div className="w-4 h-4 bg-blue-600 rounded"></div>
-                <span className="text-sm text-gray-600">선택됨</span>
-              </div>
+              <>
+                <div className="flex items-center gap-2">
+                  <div className="w-4 h-4 bg-blue-600 rounded"></div>
+                  <span className="text-sm text-gray-600">선택됨 (저장됨)</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <div className="w-4 h-4 bg-blue-400 rounded"></div>
+                  <span className="text-sm text-gray-600">선택됨 (미저장)</span>
+                </div>
+              </>
             )}
             {viewMode === 'view' && (
               <>
@@ -494,16 +686,25 @@ export default function Home() {
                   {days.map((day, dayIndex) => {
                     const slotKey = `${formatDate(day)}_${hour}`;
                     const availability = calculateSlotAvailability(slotKey);
-                    const isSelected = currentUser?.schedule?.[slotKey];
+                    const isSelected = localSchedule[slotKey];
+                    const isSaved = lastSavedSchedule[slotKey];
                     const isLastCol = dayIndex === days.length - 1;
 
                     let slotClass = 'bg-white hover:bg-gray-50 border border-gray-200';
                     let slotContent = '';
 
                     if (viewMode === 'edit') {
-                      if (isSelected) {
-                        slotClass = 'bg-blue-600 hover:bg-blue-700 text-white';
+                      if (isSelected && isSaved) {
+                        slotClass = 'bg-blue-600 hover:bg-blue-700 text-white cursor-pointer';
                         slotContent = '✓';
+                      } else if (isSelected && !isSaved) {
+                        slotClass = 'bg-blue-400 hover:bg-blue-500 text-white cursor-pointer ring-2 ring-blue-300';
+                        slotContent = '✓';
+                      } else if (!isSelected && isSaved) {
+                        slotClass = 'bg-orange-200 hover:bg-orange-300 cursor-pointer';
+                        slotContent = '−';
+                      } else {
+                        slotClass = 'bg-white hover:bg-gray-100 border border-gray-200 cursor-pointer';
                       }
                     } else {
                       if (availability.count > 0) {
@@ -521,8 +722,11 @@ export default function Home() {
                     return (
                       <div
                         key={slotKey}
-                        onClick={() => toggleTimeSlot(slotKey)}
-                        className={`p-3 text-center cursor-pointer transition-colors text-sm ${slotClass} ${isLastRow && isLastCol ? 'rounded-br-lg' : ''}`}
+                        onClick={() => viewMode === 'edit' && toggleTimeSlot(slotKey)}
+                        className={`p-3 text-center transition-all text-sm ${slotClass} ${isLastRow && isLastCol ? 'rounded-br-lg' : ''}`}
+                        title={viewMode === 'view' && availability.count > 0 
+                          ? `참여 가능: ${availability.participants.map(p => p.name).join(', ')}` 
+                          : ''}
                       >
                         {slotContent}
                       </div>
