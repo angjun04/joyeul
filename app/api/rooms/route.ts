@@ -17,7 +17,7 @@ function generateUserId(): string {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { creatorName } = body;
+    const { creatorName, startDate, endDate } = body;
 
     if (!creatorName) {
       return NextResponse.json(
@@ -37,6 +37,10 @@ export async function POST(request: NextRequest) {
     const userId = generateUserId();
     const now = new Date().toISOString();
 
+    // 날짜 처리 (기본값: 오늘부터 7일)
+    const roomStartDate = startDate || new Date().toISOString();
+    const roomEndDate = endDate || new Date(Date.now() + 6 * 24 * 60 * 60 * 1000).toISOString();
+
     const room = {
       code: roomCode,
       createdAt: now,
@@ -48,8 +52,8 @@ export async function POST(request: NextRequest) {
           joinedAt: now,
         },
       },
-      startDate: new Date().toISOString(),
-      endDate: new Date(Date.now() + 6 * 24 * 60 * 60 * 1000).toISOString(),
+      startDate: roomStartDate,
+      endDate: roomEndDate,
     };
 
     await roomStorage.setRoom(roomCode, room);

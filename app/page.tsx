@@ -1,11 +1,12 @@
 'use client';
 
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import useSWR from 'swr';
 
-const DEFAULT_START_HOUR = 9;
-const DEFAULT_END_HOUR = 22;
+const DEFAULT_START_HOUR = 0;
+const DEFAULT_END_HOUR = 24;
 const AUTOSAVE_DELAY_MS = 5000; // 5초 후 자동 저장
+const DEFAULT_DAYS_RANGE = 7; // 기본 7일
 
 interface Participant {
   id: string;
@@ -20,6 +21,14 @@ interface Room {
   participants: Record<string, Participant>;
   startDate: string;
   endDate: string;
+}
+
+interface DragSelection {
+  isSelecting: boolean;
+  startSlot: string | null;
+  endSlot: string | null;
+  selectedSlots: Set<string>;
+  initialValue: boolean;
 }
 
 const fetcher = async (url: string) => {
@@ -45,6 +54,17 @@ export default function Home() {
   const [isCreating, setIsCreating] = useState(false);
   const [successMessage, setSuccessMessage] = useState('');
   
+  // 날짜 범위 설정 (방 생성 시)
+  const [startDate, setStartDate] = useState(() => {
+    const today = new Date();
+    return today.toISOString().split('T')[0];
+  });
+  const [endDate, setEndDate] = useState(() => {
+    const date = new Date();
+    date.setDate(date.getDate() + DEFAULT_DAYS_RANGE - 1);
+    return date.toISOString().split('T')[0];
+  });
+  
   // 로컬 일정 상태 (편집 중인 데이터)
   const [localSchedule, setLocalSchedule] = useState<Record<string, boolean>>({});
   const [isSaving, setIsSaving] = useState(false);
@@ -52,6 +72,16 @@ export default function Home() {
   const [lastSavedSchedule, setLastSavedSchedule] = useState<Record<string, boolean>>({});
   const [autoSaveEnabled, setAutoSaveEnabled] = useState(false);
   const [autoSaveTimer, setAutoSaveTimer] = useState<NodeJS.Timeout | null>(null);
+
+  // 드래그 선택 상태
+  const [dragSelection, setDragSelection] = useState<DragSelection>({
+    isSelecting: false,
+    startSlot: null,
+    endSlot: null,
+    selectedSlots: new Set(),
+    initialValue: false
+  });
+  const gridRef = useRef<HTMLDivElement>(null);
 
   // Use SWR for real-time room updates
   const { data: roomData, mutate } = useSWR(
@@ -118,12 +148,30 @@ export default function Home() {
       return;
     }
 
+    // 날짜 검증
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    if (start > end) {
+      setLoginError('종료일이 시작일보다 빠를 수 없습니다.');
+      return;
+    }
+    
+    const daysDiff = Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24)) + 1;
+    if (daysDiff > 30) {
+      setLoginError('최대 30일까지만 설정 가능합니다.');
+      return;
+    }
+
     setIsCreating(true);
     try {
       const response = await fetch('/api/rooms', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ creatorName: userName }),
+        body: JSON.stringify({ 
+          creatorName: userName,
+          startDate: new Date(startDate).toISOString(),
+          endDate: new Date(endDate + 'T23:59:59').toISOString()
+        }),
       });
 
       if (!response.ok) throw new Error('Failed to create room');
@@ -204,6 +252,109 @@ export default function Home() {
       setLoginError('방 참여에 실패했습니다.');
     }
   };
+
+  // 드래그 선택을 위한 함수들
+  const getSlotRange = (start: string, end: string): string[] => {
+    const days = getDaysInRange();
+    const slots: string[] = [];
+    
+    // 시작과 끝 슬롯 파싱
+    const [startDate, startHour] = start.split('_').map(s => s.includes('-') ? s : parseInt(s));
+    const [endDate, endHour] = end.split('_').map(s => s.includes('-') ? s : parseInt(s));
+    
+    let startDayIndex = days.findIndex(d => formatDate(d) === startDate);
+    let endDayIndex = days.findIndex(d => formatDate(d) === endDate);
+    let startH = parseInt(startHour as string);
+    let endH = parseInt(endHour as string);
+    
+    // 범위 정규화 (시작이 끝보다 뒤에 있는 경우 처리)
+    if (startDayIndex > endDayIndex || (startDayIndex === endDayIndex && startH > endH)) {
+      [startDayIndex, endDayIndex] = [endDayIndex, startDayIndex];
+      [startH, endH] = [endH, startH];
+    }
+    
+    // 범위 내 모든 슬롯 추가
+    for (let dayIdx = startDayIndex; dayIdx <= endDayIndex; dayIdx++) {
+      const day = days[dayIdx];
+      const dayStr = formatDate(day);
+      
+      const hourStart = dayIdx === startDayIndex ? startH : DEFAULT_START_HOUR;
+      const hourEnd = dayIdx === endDayIndex ? endH : DEFAULT_END_HOUR - 1;
+      
+      for (let hour = hourStart; hour <= hourEnd; hour++) {
+        slots.push(`${dayStr}_${hour}`);
+      }
+    }
+    
+    return slots;
+  };
+
+  const handleMouseDown = (slotKey: string) => {
+    if (viewMode !== 'edit') return;
+    
+    // 현재 슬롯의 상태를 확인하여 토글할 값 결정
+    const currentValue = localSchedule[slotKey] || false;
+    
+    setDragSelection({
+      isSelecting: true,
+      startSlot: slotKey,
+      endSlot: slotKey,
+      selectedSlots: new Set([slotKey]),
+      initialValue: !currentValue // 반대값으로 토글
+    });
+    
+    // 즉시 토글
+    toggleTimeSlot(slotKey);
+  };
+
+  const handleMouseEnter = (slotKey: string) => {
+    if (!dragSelection.isSelecting || viewMode !== 'edit') return;
+    
+    // 드래그 범위 업데이트
+    const range = getSlotRange(dragSelection.startSlot!, slotKey);
+    setDragSelection(prev => ({
+      ...prev,
+      endSlot: slotKey,
+      selectedSlots: new Set(range)
+    }));
+    
+    // 범위 내 모든 슬롯을 초기값으로 설정
+    setLocalSchedule(prev => {
+      const newSchedule = { ...prev };
+      range.forEach(slot => {
+        if (dragSelection.initialValue) {
+          newSchedule[slot] = true;
+        } else {
+          delete newSchedule[slot];
+        }
+      });
+      return newSchedule;
+    });
+  };
+
+  const handleMouseUp = () => {
+    setDragSelection({
+      isSelecting: false,
+      startSlot: null,
+      endSlot: null,
+      selectedSlots: new Set(),
+      initialValue: false
+    });
+  };
+
+  // 전역 마우스 이벤트 (드래그가 그리드 밖에서 끝날 때 처리)
+  useEffect(() => {
+    const handleGlobalMouseUp = () => {
+      if (dragSelection.isSelecting) {
+        handleMouseUp();
+      }
+    };
+
+    document.addEventListener('mouseup', handleGlobalMouseUp);
+    return () => {
+      document.removeEventListener('mouseup', handleGlobalMouseUp);
+    };
+  }, [dragSelection.isSelecting]);
 
   // 로컬에서만 토글 (서버 요청 없음)
   const toggleTimeSlot = (slotKey: string) => {
@@ -419,6 +570,38 @@ export default function Home() {
               />
             </div>
 
+            {/* 날짜 범위 선택 (방 생성 시) */}
+            {!roomCode && (
+              <div className="space-y-3 p-4 bg-gray-50 rounded-lg">
+                <label className="block text-sm font-medium text-gray-700">
+                  일정 조율 기간 <span className="font-normal text-gray-400 text-xs">(방 생성 시)</span>
+                </label>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs text-gray-600 mb-1">시작일</label>
+                    <input
+                      type="date"
+                      value={startDate}
+                      onChange={(e) => setStartDate(e.target.value)}
+                      min={new Date().toISOString().split('T')[0]}
+                      className="w-full px-3 py-2 bg-white border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-600 mb-1">종료일</label>
+                    <input
+                      type="date"
+                      value={endDate}
+                      onChange={(e) => setEndDate(e.target.value)}
+                      min={startDate}
+                      className="w-full px-3 py-2 bg-white border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                    />
+                  </div>
+                </div>
+                <p className="text-xs text-gray-500 mt-1">최대 30일까지 설정 가능합니다</p>
+              </div>
+            )}
+
             {successMessage && (
               <div className="bg-green-50 border border-green-200 text-green-700 p-4 rounded-lg text-sm flex items-start">
                 <svg className="w-5 h-5 mr-2 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
@@ -462,6 +645,11 @@ export default function Home() {
   const currentUser = currentRoom.participants?.[currentUserId];
   const totalParticipants = Object.keys(currentRoom.participants || {}).length;
   const bestTimes = findBestTimes();
+
+  // 시간 포맷팅 (0시 -> 00:00, 13시 -> 13:00)
+  const formatHour = (hour: number): string => {
+    return `${hour.toString().padStart(2, '0')}:00`;
+  };
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -605,6 +793,16 @@ export default function Home() {
           </div>
         )}
 
+        {/* 드래그 안내 */}
+        {viewMode === 'edit' && (
+          <div className="mb-4 bg-blue-50 border border-blue-200 text-blue-700 p-3 rounded-lg text-sm flex items-center">
+            <svg className="w-5 h-5 mr-2" fill="currentColor" viewBox="0 0 20 20">
+              <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
+            </svg>
+            💡 마우스를 드래그하여 여러 시간을 한 번에 선택할 수 있습니다.
+          </div>
+        )}
+
         {/* Participants */}
         <div className="bg-white rounded-xl border border-gray-200 p-6 mb-8">
           <h3 className="text-lg font-semibold text-gray-900 mb-4">참여자 ({totalParticipants}명)</h3>
@@ -646,6 +844,10 @@ export default function Home() {
                   <div className="w-4 h-4 bg-blue-400 rounded"></div>
                   <span className="text-sm text-gray-600">선택됨 (미저장)</span>
                 </div>
+                <div className="flex items-center gap-2">
+                  <div className="w-4 h-4 bg-blue-200 rounded ring-2 ring-blue-400"></div>
+                  <span className="text-sm text-gray-600">드래그 중</span>
+                </div>
               </>
             )}
             {viewMode === 'view' && (
@@ -662,9 +864,19 @@ export default function Home() {
             )}
           </div>
           
-          <div className="grid grid-cols-[80px_repeat(var(--days-count),_minmax(100px,_1fr))] gap-0.5 min-w-[600px]" style={{ '--days-count': days.length } as React.CSSProperties}>
+          <div 
+            ref={gridRef}
+            className="grid grid-cols-[80px_repeat(var(--days-count),_minmax(100px,_1fr))] gap-0.5 min-w-[600px] select-none" 
+            style={{ '--days-count': days.length } as React.CSSProperties}
+            onMouseLeave={() => {
+              if (dragSelection.isSelecting) {
+                // 그리드를 벗어나면 드래그 취소
+                handleMouseUp();
+              }
+            }}
+          >
             {/* Header */}
-            <div className="bg-gray-50 p-3 text-center font-medium text-sm text-gray-700 rounded-tl-lg">시간</div>
+            <div className="bg-gray-50 p-3 text-center font-medium text-sm text-gray-700 rounded-tl-lg sticky left-0 z-10">시간</div>
             {days.map((day, index) => (
               <div key={day.toISOString()} className={`bg-gray-50 p-3 text-center font-medium text-sm text-gray-700 ${index === days.length - 1 ? 'rounded-tr-lg' : ''}`}>
                 {day.getMonth() + 1}/{day.getDate()}<br />
@@ -680,8 +892,8 @@ export default function Home() {
               const isLastRow = i === DEFAULT_END_HOUR - DEFAULT_START_HOUR - 1;
               return (
                 <React.Fragment key={hour}>
-                  <div className={`bg-gray-50 p-3 text-center font-medium text-sm text-gray-700 ${isLastRow ? 'rounded-bl-lg' : ''}`}>
-                    {hour}:00
+                  <div className={`bg-gray-50 p-3 text-center font-medium text-sm text-gray-700 sticky left-0 z-10 ${isLastRow ? 'rounded-bl-lg' : ''}`}>
+                    {formatHour(hour)}
                   </div>
                   {days.map((day, dayIndex) => {
                     const slotKey = `${formatDate(day)}_${hour}`;
@@ -689,12 +901,16 @@ export default function Home() {
                     const isSelected = localSchedule[slotKey];
                     const isSaved = lastSavedSchedule[slotKey];
                     const isLastCol = dayIndex === days.length - 1;
+                    const isDragging = dragSelection.selectedSlots.has(slotKey);
 
                     let slotClass = 'bg-white hover:bg-gray-50 border border-gray-200';
                     let slotContent = '';
 
                     if (viewMode === 'edit') {
-                      if (isSelected && isSaved) {
+                      if (isDragging) {
+                        slotClass = 'bg-blue-200 ring-2 ring-blue-400 cursor-pointer';
+                        slotContent = dragSelection.initialValue ? '✓' : '';
+                      } else if (isSelected && isSaved) {
                         slotClass = 'bg-blue-600 hover:bg-blue-700 text-white cursor-pointer';
                         slotContent = '✓';
                       } else if (isSelected && !isSaved) {
@@ -722,7 +938,8 @@ export default function Home() {
                     return (
                       <div
                         key={slotKey}
-                        onClick={() => viewMode === 'edit' && toggleTimeSlot(slotKey)}
+                        onMouseDown={() => viewMode === 'edit' && handleMouseDown(slotKey)}
+                        onMouseEnter={() => viewMode === 'edit' && handleMouseEnter(slotKey)}
                         className={`p-3 text-center transition-all text-sm ${slotClass} ${isLastRow && isLastCol ? 'rounded-br-lg' : ''}`}
                         title={viewMode === 'view' && availability.count > 0 
                           ? `참여 가능: ${availability.participants.map(p => p.name).join(', ')}` 
@@ -776,7 +993,7 @@ export default function Home() {
                             {index + 1}
                           </span>
                           <div className="font-medium text-gray-900">
-                            {time.date.getMonth() + 1}월 {time.date.getDate()}일 ({['일', '월', '화', '수', '목', '금', '토'][time.date.getDay()]}) {time.hour}:00 - {time.hour + 1}:00
+                            {time.date.getMonth() + 1}월 {time.date.getDate()}일 ({['일', '월', '화', '수', '목', '금', '토'][time.date.getDay()]}) {formatHour(time.hour)} - {formatHour(time.hour + 1)}
                           </div>
                         </div>
                         <div className="ml-11">
@@ -816,6 +1033,11 @@ export default function Home() {
               })}
             </div>
           )}
+        </div>
+
+        {/* 기간 정보 */}
+        <div className="mt-8 text-center text-sm text-gray-500">
+          조율 기간: {new Date(currentRoom.startDate).toLocaleDateString('ko-KR')} ~ {new Date(currentRoom.endDate).toLocaleDateString('ko-KR')}
         </div>
       </div>
     </div>
